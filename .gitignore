@@ -1,51 +1,98 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
+# =============================================================================
+# Polymarket Arbitrage Bot - Git Ignore
+# =============================================================================
 
-# Dependency directories
-node_modules/
-
-# Build output
-dist/
-build/
-out/
-
-# TypeScript files
-*.tsbuildinfo
-
-# Environment variables
+# =============================================================================
+# 私密数据和环境配置 (CRITICAL - Never commit these!)
+# =============================================================================
 .env
+.env.*
+*.env
+.env.local
+.env.production
+.env.development
 
-# Temporary files
-*.tmp
-*.temp
+# API Keys and Secrets
+secrets/
+*.pem
+*.key
+*.secret
 
-# Editor and OS-specific files
-.vscode/
+# =============================================================================
+# 日志和交易数据 (敏感数据，不上传)
+# =============================================================================
+logs/
+*.log
+bot.log
+nohup.out
+
+# Trading data
+agents/arbitrage/logs/
+trades/
+signals/
+daily/
+*.json.bak
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# =============================================================================
+# IDE and Editor
+# =============================================================================
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 
-# Optional lock files (keep package-lock.json for CI/CD)
-yarn.lock
-pnpm-lock.yaml
-
-# Coverage reports
-coverage/
-
+# =============================================================================
 # Testing
-jest-test-results.json
-.nyc_output/
-.vitest/
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
 
-# Lint and formatting cache
-.eslintcache
-.prettiercache
+# =============================================================================
+# Jupyter
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb
 
-.yarn
-simulation_results
-trader_data_cache
+# =============================================================================
+# Other
+# =============================================================================
+*.bak
+*.tmp
+*.temp
+.cache/
