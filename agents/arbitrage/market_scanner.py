@@ -113,19 +113,43 @@ class MarketScanner:
                         ))
                 elif "outcomes" in item:
                     # Alternative format from Gamma API
-                    clob_ids = item.get("clobTokenIds", item.get("clob_token_ids", []))
-                    if isinstance(clob_ids, str):
-                        clob_ids = clob_ids.strip('[]').replace('"', '').split(',')
+                    # All fields may be JSON strings that need parsing
+                    import json as json_parser
                     
-                    # Parse outcome prices (may be string or list)
-                    outcome_prices = item.get("outcomePrices", item.get("outcome_prices", []))
-                    if isinstance(outcome_prices, str):
-                        outcome_prices = outcome_prices.strip('[]').replace('"', '').split(',')
-                        outcome_prices = [float(p) if p.strip() else 0 for p in outcome_prices]
+                    # Parse outcomes (may be JSON string like '["Yes", "No"]')
+                    outcomes_raw = item.get("outcomes", "[]")
+                    if isinstance(outcomes_raw, str):
+                        try:
+                            outcomes = json_parser.loads(outcomes_raw) if outcomes_raw else []
+                        except:
+                            outcomes = []
+                    else:
+                        outcomes = outcomes_raw if outcomes_raw else []
                     
-                    for i, outcome in enumerate(item["outcomes"]):
-                        token_id = clob_ids[i].strip() if i < len(clob_ids) else ""
-                        price = float(outcome_prices[i]) if i < len(outcome_prices) else 0
+                    # Parse clobTokenIds (JSON string like '["token1", "token2"]')
+                    clob_ids_raw = item.get("clobTokenIds", item.get("clob_token_ids", "[]"))
+                    if isinstance(clob_ids_raw, str):
+                        try:
+                            clob_ids = json_parser.loads(clob_ids_raw) if clob_ids_raw else []
+                        except:
+                            clob_ids = []
+                    else:
+                        clob_ids = clob_ids_raw if clob_ids_raw else []
+                    
+                    # Parse outcome prices (JSON string or list)
+                    outcome_prices_raw = item.get("outcomePrices", item.get("outcome_prices", "[]"))
+                    if isinstance(outcome_prices_raw, str):
+                        try:
+                            outcome_prices = json_parser.loads(outcome_prices_raw) if outcome_prices_raw else []
+                            outcome_prices = [float(p) for p in outcome_prices]
+                        except:
+                            outcome_prices = []
+                    else:
+                        outcome_prices = [float(p) for p in outcome_prices_raw] if outcome_prices_raw else []
+                    
+                    for i, outcome in enumerate(outcomes):
+                        token_id = clob_ids[i] if i < len(clob_ids) else ""
+                        price = outcome_prices[i] if i < len(outcome_prices) else 0
                         tokens.append(MarketToken(
                             token_id=token_id,
                             outcome=outcome,
