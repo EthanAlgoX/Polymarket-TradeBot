@@ -23,6 +23,7 @@ from agents.arbitrage.config import (
     TRAILING_STOP_PERCENT, FEE_RATE
 )
 from agents.arbitrage.position_manager import PositionManager, Position, PositionSide
+from agents.arbitrage.price_utils import get_effective_prices, check_arbitrage as check_arb, ArbitrageInfo
 
 logger = logging.getLogger("ArbitrageStrategy")
 
@@ -84,44 +85,64 @@ class ArbitrageStrategy:
         orderbooks: List[OrderbookSnapshot]
     ) -> Optional[ArbitrageOpportunity]:
         """
-        Detects Negative Risk / Spread Arbitrage opportunities.
+        Detects arbitrage opportunities using EFFECTIVE PRICES.
         
-        Logic: If sum(BestAsk for all outcomes) < 1.0, we can buy all 
-        outcomes and guarantee a payout of 1.0.
+        CRITICAL: Polymarket orderbooks have a mirror property:
+            Buy YES @ P = Sell NO @ (1-P)
+        
+        This means the same order appears in BOTH orderbooks!
+        Simple sum(ask_YES + ask_NO) causes double-counting (~1.998 not ~1.0)
+        
+        Correct approach uses effective prices:
+            effective_buy_yes = min(yes_ask, 1 - no_bid)
+            effective_buy_no = min(no_ask, 1 - yes_bid)
+            long_cost = effective_buy_yes + effective_buy_no
+            
+        If long_cost < 1, we have a long arbitrage opportunity.
         """
-        if not orderbooks:
+        if len(orderbooks) < 2:
             return None
 
-        # Ensure all orderbooks are valid and have at least one ask
+        # Need both orderbooks to have valid bids and asks
         for ob in orderbooks:
-            if not ob.asks:
+            if not ob.asks or not ob.bids:
                 return None
 
-        # Extract best asks and their potential max volume
-        best_asks = [ob.best_ask for ob in orderbooks]
-
-        # Calculate total cost to buy 1 unit of each outcome
-        total_cost = sum(best_asks)
-
-        # Adjust for potential fees
-        total_cost_with_fee = total_cost * (1 + self.fee)
-
-        # Profit calculation: Payout (1.0) - Cost
-        potential_profit = 1.0 - total_cost_with_fee
-
-        # Check if profit meets threshold
-        if potential_profit >= self.min_profit:
+        # Identify YES and NO orderbooks (assume first is YES, second is NO)
+        yes_ob = orderbooks[0]
+        no_ob = orderbooks[1]
+        
+        yes_ask = yes_ob.best_ask
+        yes_bid = yes_ob.best_bid
+        no_ask = no_ob.best_ask
+        no_bid = no_ob.best_bid
+        
+        # Calculate effective prices (handles mirror orders correctly)
+        eff = get_effective_prices(yes_ask, yes_bid, no_ask, no_bid)
+        
+        # Check for long arbitrage using effective prices
+        arb_info = check_arb(yes_ask, yes_bid, no_ask, no_bid, self.min_profit)
+        
+        if arb_info:
             # Calculate max executable volume based on top level liquidity
+            # Use smaller of: YES ask size, NO ask size (for long arb)
             top_volumes = [ob.asks[0].size for ob in orderbooks]
             max_volume = min(top_volumes)
-
+            
+            logger.info(
+                f"📊 Arbitrage Found ({arb_info.type.upper()}): "
+                f"profit={arb_info.profit_percent:.2f}% "
+                f"cost={arb_info.cost_or_revenue:.4f} "
+                f"(buy_yes={eff.effective_buy_yes:.4f}, buy_no={eff.effective_buy_no:.4f})"
+            )
+            
             return ArbitrageOpportunity(
                 market_id=market_id,
                 timestamp=orderbooks[0].timestamp,
                 outcomes=[ob.asset_id for ob in orderbooks],
-                prices=best_asks,
-                total_cost=total_cost,
-                potential_profit=potential_profit,
+                prices=[eff.effective_buy_yes, eff.effective_buy_no],
+                total_cost=eff.long_cost,
+                potential_profit=arb_info.profit,
                 max_volume=max_volume
             )
 
