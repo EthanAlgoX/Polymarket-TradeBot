@@ -40,6 +40,7 @@ logger = logging.getLogger("RealtimeService")
 # WebSocket endpoints
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 ACTIVITY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/activity"
+CHAINLINK_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/prices"  # From poly-sdk-main
 
 
 class ConnectionStatus(Enum):
@@ -116,6 +117,18 @@ class ActivityTrade:
     trader_name: Optional[str] = None
 
 
+@dataclass
+class CryptoPrice:
+    """
+    External crypto price from Chainlink (from poly-sdk-main).
+    
+    Used for DipArb strategy to track underlying asset prices.
+    """
+    symbol: str  # e.g., "ETH/USD"
+    price: float
+    timestamp: float
+
+
 class RealtimeService:
     """
     Real-time WebSocket service for Polymarket.
@@ -158,10 +171,21 @@ class RealtimeService:
             'price': [],
             'trade': [],
             'activity': [],
+            'chainlink': [],  # NEW: Chainlink price updates
             'connected': [],
             'disconnected': [],
             'error': [],
         }
+        
+        # Chainlink subscriptions (from poly-sdk-main)
+        self._chainlink_symbols: List[str] = []
+        self._chainlink_cache: Dict[str, CryptoPrice] = {}
+        
+        # Smart logging (from poly-sdk-main)
+        self._last_orderbook_log_time: float = 0
+        self.ORDERBOOK_LOG_INTERVAL_MS: int = 10000  # Log every 10 seconds
+        self._orderbook_buffer: List[Dict] = []
+        self.ORDERBOOK_BUFFER_SIZE: int = 50
         
         # Check websockets availability
         if not WEBSOCKETS_AVAILABLE:
@@ -278,6 +302,50 @@ class RealtimeService:
             )
         
         logger.info("Subscribed to activity stream")
+    
+    def subscribe_chainlink_prices(
+        self,
+        symbols: List[str],
+        handlers: Dict[str, Callable] = None
+    ):
+        """
+        Subscribe to Chainlink oracle prices for underlying assets.
+        
+        Ported from poly-sdk-main RealtimeServiceV2.subscribeCryptoChainlinkPrices().
+        
+        Args:
+            symbols: List of symbols like ["ETH/USD", "BTC/USD"]
+            handlers: Optional handlers:
+                - on_price: Called with CryptoPrice
+        """
+        if handlers and handlers.get('on_price'):
+            self.on('chainlink', handlers['on_price'])
+        
+        self._chainlink_symbols.extend(symbols)
+        
+        # Build subscription message
+        subscriptions = [
+            {
+                "topic": "prices",
+                "type": "crypto_chainlink",
+                "filters": json.dumps(symbols)
+            }
+        ]
+        
+        sub_msg = {"subscriptions": subscriptions}
+        self._subscription_messages.append(sub_msg)
+        
+        if self._status == ConnectionStatus.CONNECTED and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_message(sub_msg),
+                self._loop
+            )
+        
+        logger.info(f"Subscribed to Chainlink prices: {symbols}")
+    
+    def get_chainlink_price(self, symbol: str) -> Optional[CryptoPrice]:
+        """Get cached Chainlink price for symbol."""
+        return self._chainlink_cache.get(symbol)
     
     # =========================================================================
     # Event Handlers
@@ -404,6 +472,10 @@ class RealtimeService:
         elif topic == "activity":
             if msg_type in ["trades", "orders_matched"]:
                 self._handle_activity(msg)
+        
+        elif topic == "prices":
+            if msg_type == "crypto_chainlink":
+                self._handle_chainlink_price(msg)
     
     def _handle_orderbook(self, msg: dict):
         """Handle orderbook update."""
@@ -506,6 +578,52 @@ class RealtimeService:
         )
         
         self._emit('activity', activity)
+    
+    def _handle_chainlink_price(self, msg: dict):
+        """Handle Chainlink price update (from poly-sdk-main)."""
+        data = msg.get("data", {})
+        symbol = data.get("symbol", "")
+        
+        if not symbol:
+            return
+        
+        crypto_price = CryptoPrice(
+            symbol=symbol,
+            price=float(data.get("price", 0)),
+            timestamp=float(data.get("timestamp", time.time()))
+        )
+        
+        self._chainlink_cache[symbol] = crypto_price
+        self._emit('chainlink', crypto_price)
+        
+        if self.debug:
+            logger.debug(f"Chainlink: {symbol} = ${crypto_price.price:.2f}")
+    
+    def _update_orderbook_buffer(self, asset_id: str, best_bid: float, best_ask: float):
+        """Update smart logging buffer (from poly-sdk-main)."""
+        self._orderbook_buffer.append({
+            'timestamp': time.time(),
+            'asset_id': asset_id,
+            'best_bid': best_bid,
+            'best_ask': best_ask
+        })
+        if len(self._orderbook_buffer) > self.ORDERBOOK_BUFFER_SIZE:
+            self._orderbook_buffer.pop(0)
+    
+    def _maybe_log_orderbook_summary(self):
+        """Log aggregated orderbook stats every 10 seconds (from poly-sdk-main)."""
+        now = time.time() * 1000
+        if now - self._last_orderbook_log_time < self.ORDERBOOK_LOG_INTERVAL_MS:
+            return
+        
+        if not self._orderbook_buffer:
+            return
+        
+        self._last_orderbook_log_time = now
+        
+        # Log summary
+        if self.debug:
+            logger.debug(f"📊 Orderbook buffer: {len(self._orderbook_buffer)} entries in last 10s")
 
 
 # Convenience function for synchronous usage

@@ -72,9 +72,73 @@ def categorize_market(title: str) -> MarketCategory:
     return MarketCategory.OTHER
 
 
+# Category colors for charts (from poly-sdk-main)
+CATEGORY_COLORS = {
+    MarketCategory.CRYPTO: '#f7931a',      # Bitcoin orange
+    MarketCategory.POLITICS: '#3b82f6',    # Blue
+    MarketCategory.SPORTS: '#22c55e',      # Green
+    MarketCategory.ENTERTAINMENT: '#a855f7', # Purple
+    MarketCategory.ECONOMICS: '#eab308',   # Yellow
+    MarketCategory.SCIENCE: '#06b6d4',     # Cyan
+    MarketCategory.OTHER: '#6b7280',       # Gray
+}
+
+
 # ============================================================================
 # Types
 # ============================================================================
+
+@dataclass
+class SmartMoneyLeaderboardEntry:
+    """
+    Smart Money Leaderboard entry with extended fields.
+    
+    Ported from poly-sdk-main SmartMoneyLeaderboardEntry.
+    """
+    address: str
+    rank: int
+    pnl: float
+    volume: float
+    trade_count: int = 0
+    user_name: Optional[str] = None
+    profile_image: Optional[str] = None
+    x_username: Optional[str] = None
+    verified_badge: bool = False
+    # Extended fields from poly-sdk-main
+    total_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    buy_count: int = 0
+    sell_count: int = 0
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+    maker_volume: float = 0.0
+    taker_volume: float = 0.0
+    
+    @classmethod
+    def from_api(cls, data: dict, rank: int = 0) -> 'SmartMoneyLeaderboardEntry':
+        """Create from API response."""
+        return cls(
+            address=data.get('proxyWallet', data.get('address', '')).lower(),
+            rank=rank,
+            pnl=float(data.get('pnl', 0)),
+            volume=float(data.get('volume', 0)),
+            trade_count=int(data.get('tradeCount', 0)),
+            user_name=data.get('name', data.get('userName')),
+            profile_image=data.get('profileImage'),
+            x_username=data.get('xUsername'),
+            verified_badge=data.get('verifiedBadge', False),
+            # Extended fields
+            total_pnl=float(data.get('totalPnl', data.get('pnl', 0))),
+            realized_pnl=float(data.get('realizedPnl', 0)),
+            unrealized_pnl=float(data.get('unrealizedPnl', 0)),
+            buy_count=int(data.get('buyCount', 0)),
+            sell_count=int(data.get('sellCount', 0)),
+            buy_volume=float(data.get('buyVolume', 0)),
+            sell_volume=float(data.get('sellVolume', 0)),
+            maker_volume=float(data.get('makerVolume', 0)),
+            taker_volume=float(data.get('takerVolume', 0)),
+        )
 
 @dataclass
 class SmartMoneyWallet:

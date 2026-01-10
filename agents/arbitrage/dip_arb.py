@@ -157,6 +157,19 @@ class DipArbStats:
     total_stop_loss: float = 0.0
     markets_rotated: int = 0
     running_time_ms: float = 0
+    pairs_merged_at_startup: float = 0.0  # NEW: Pairs auto-merged at startup
+    emergency_exits: int = 0  # NEW: Emergency exit count
+
+
+@dataclass
+class DipArbPendingRedemption:
+    """Pending redemption after market resolution (from poly-sdk-main)."""
+    condition_id: str
+    up_token_id: str
+    down_token_id: str
+    shares: float
+    market_end_time: float
+    created_at: float = field(default_factory=time.time)
 
 
 class DipArbService:
@@ -184,16 +197,28 @@ class DipArbService:
         self._last_execution_time: float = 0
         self._is_running: bool = False
         
-        # Price history with sliding window
+        # Price history with sliding window (increased buffer from poly-sdk-main)
         self._price_history: deque = deque(maxlen=1000)
+        self.MAX_HISTORY_LENGTH = 100  # Keep last 100 price points for analysis
         
         # Callbacks
         self._on_signal: Optional[Callable[[DipArbSignal], None]] = None
         self._on_merge: Optional[Callable[[str, float], None]] = None
         self._on_market_rotate: Optional[Callable[[DipArbMarketConfig], None]] = None
+        self._on_redeem: Optional[Callable[[str, float], None]] = None  # NEW: redemption callback
         
         # Background tasks
         self._stop_loss_task: Optional[asyncio.Task] = None
+        
+        # Pending redemptions for resolved markets (from poly-sdk-main)
+        self._pending_redemptions: List = []
+        self._redeem_check_interval: Optional[asyncio.Task] = None
+        
+        # Smart logging state (from poly-sdk-main)
+        self._last_orderbook_log_time: float = 0
+        self.ORDERBOOK_LOG_INTERVAL_MS: int = 10000  # Log orderbook every 10 seconds
+        self._orderbook_buffer: List[Dict] = []
+        self.ORDERBOOK_BUFFER_SIZE: int = 50  # Keep 5 seconds of data
         
         logger.info(f"DipArbService {self.VERSION} initialized")
         logger.info(f"Config: window={self.config.sliding_window_ms}ms, dip={self.config.dip_threshold*100:.0f}%, target={self.config.sum_target}")
@@ -234,7 +259,74 @@ class DipArbService:
         self._market = market
         self._reset_round()
         self._price_history.clear()
+        self._orderbook_buffer.clear()
         logger.info(f"Market set: {market.name} ({market.underlying} {market.duration_minutes}m)")
+    
+    async def scan_and_merge_existing_pairs(
+        self,
+        get_balance_fn: Callable[[str, str, str], tuple],
+        merge_fn: Callable[[str, str, str, float], bool]
+    ) -> Dict:
+        """
+        Scan and merge existing UP/DOWN pairs at startup.
+        
+        Ported from poly-sdk-main DipArbService.scanAndMergeExistingPairs().
+        When the service starts or rotates to a new market, check if there are
+        existing UP + DOWN token pairs from previous sessions and merge them.
+        
+        Args:
+            get_balance_fn: async (condition_id, up_token_id, down_token_id) -> (up_balance, down_balance)
+            merge_fn: async (condition_id, up_token_id, down_token_id, amount) -> bool
+        
+        Returns:
+            Dict with merge results
+        """
+        if not self._market:
+            return {'success': False, 'error': 'No market configured'}
+        
+        try:
+            # Get current balances
+            up_balance, down_balance = await get_balance_fn(
+                self._market.condition_id,
+                self._market.up_token_id,
+                self._market.down_token_id
+            )
+            
+            # Calculate pairs to merge
+            pairs_to_merge = min(up_balance, down_balance)
+            
+            if pairs_to_merge > 0.01:  # Minimum 0.01 to avoid dust
+                logger.info(f"🔍 Found existing pairs: UP={up_balance:.2f}, DOWN={down_balance:.2f}")
+                logger.info(f"🔄 Auto-merging {pairs_to_merge:.2f} pairs at startup...")
+                
+                success = await merge_fn(
+                    self._market.condition_id,
+                    self._market.up_token_id,
+                    self._market.down_token_id,
+                    pairs_to_merge
+                )
+                
+                if success:
+                    self._stats.pairs_merged_at_startup += pairs_to_merge
+                    logger.info(f"✅ Startup merge successful: {pairs_to_merge:.2f} pairs → ${pairs_to_merge:.2f} USDC.e")
+                    return {
+                        'success': True,
+                        'pairs_merged': pairs_to_merge,
+                        'usdc_recovered': pairs_to_merge
+                    }
+                else:
+                    logger.error("❌ Startup merge failed")
+                    return {'success': False, 'error': 'Merge transaction failed'}
+            
+            elif up_balance > 0 or down_balance > 0:
+                logger.info(f"📊 Existing positions: UP={up_balance:.2f}, DOWN={down_balance:.2f} (no pairs to merge)")
+                return {'success': True, 'pairs_merged': 0, 'note': 'No complete pairs'}
+            
+            return {'success': True, 'pairs_merged': 0}
+            
+        except Exception as e:
+            logger.warning(f"Warning: Failed to scan existing pairs: {e}")
+            return {'success': False, 'error': str(e)}
     
     async def rotate_to_next_market(self, next_market: DipArbMarketConfig):
         """
@@ -302,6 +394,41 @@ class DipArbService:
         
         return signal
     
+    def get_price_from_history(self, side: str, ms_ago: int) -> Optional[float]:
+        """
+        Get price from N milliseconds ago for sliding window detection.
+        
+        Ported from poly-sdk-main DipArbService.getPriceFromHistory().
+        
+        Args:
+            side: 'UP' or 'DOWN'
+            ms_ago: Milliseconds ago (e.g., 3000 for 3 seconds)
+        
+        Returns:
+            Price from that time, or None if not available
+        """
+        if not self._price_history:
+            return None
+        
+        target_ts = time.time() - (ms_ago / 1000.0)
+        key = 'up_ask' if side == 'UP' else 'down_ask'
+        
+        # Find closest price point to target timestamp
+        closest_price = None
+        closest_delta = float('inf')
+        
+        for p in self._price_history:
+            delta = abs(p.timestamp - target_ts)
+            if delta < closest_delta:
+                closest_delta = delta
+                closest_price = getattr(p, key)
+        
+        # Only return if within reasonable range (100ms tolerance)
+        if closest_delta <= 0.1:
+            return closest_price
+        
+        return None
+    
     def _detect_sliding_window_dip(self, side: DipArbSide, current_ts: float) -> Optional[float]:
         """
         Detect dip within sliding window.
@@ -345,6 +472,44 @@ class DipArbService:
             return dip_pct
         
         return None
+    
+    def _update_orderbook_buffer(self, up_ask: float, down_ask: float, up_depth: float = 0, down_depth: float = 0):
+        """Update smart logging buffer (from poly-sdk-main)."""
+        self._orderbook_buffer.append({
+            'timestamp': time.time(),
+            'up_ask': up_ask,
+            'down_ask': down_ask,
+            'up_depth': up_depth,
+            'down_depth': down_depth
+        })
+        if len(self._orderbook_buffer) > self.ORDERBOOK_BUFFER_SIZE:
+            self._orderbook_buffer.pop(0)
+    
+    def _maybe_log_orderbook_summary(self):
+        """Log aggregated orderbook stats every 10 seconds (from poly-sdk-main)."""
+        now = time.time() * 1000
+        if now - self._last_orderbook_log_time < self.ORDERBOOK_LOG_INTERVAL_MS:
+            return
+        
+        if not self._orderbook_buffer:
+            return
+        
+        self._last_orderbook_log_time = now
+        
+        # Calculate averages from buffer
+        up_asks = [b['up_ask'] for b in self._orderbook_buffer if b['up_ask'] > 0]
+        down_asks = [b['down_ask'] for b in self._orderbook_buffer if b['down_ask'] > 0]
+        
+        if up_asks and down_asks:
+            avg_up = sum(up_asks) / len(up_asks)
+            avg_down = sum(down_asks) / len(down_asks)
+            avg_sum = avg_up + avg_down
+            
+            if self.config.debug:
+                logger.debug(
+                    f"📊 Orderbook (10s avg): UP={avg_up:.4f}, DOWN={avg_down:.4f}, "
+                    f"Sum={avg_sum:.4f}, Gap={1-avg_sum:.4f}"
+                )
     
     def _check_leg1_opportunity(
         self,
@@ -546,6 +711,64 @@ class DipArbService:
                 logger.error(f"Merge failed: {e}")
         
         self._reset_round()
+    
+    async def emergency_exit_leg1(self, sell_fn: Callable[[str, float], bool] = None) -> Dict:
+        """
+        Emergency exit Leg1 position.
+        
+        Ported from poly-sdk-main DipArbService.emergencyExitLeg1().
+        Sells the Leg1 tokens at market price to avoid unhedged exposure.
+        
+        Args:
+            sell_fn: async (token_id, shares) -> bool
+        
+        Returns:
+            Dict with exit result
+        """
+        if not self._current_round or not self._current_round.leg1:
+            return {'success': False, 'error': 'No open Leg1 position'}
+        
+        leg1 = self._current_round.leg1
+        
+        logger.warning(
+            f"🚨 EMERGENCY EXIT: Selling {leg1.shares:.2f} {leg1.side.value} tokens"
+        )
+        
+        # Cancel stop loss timer
+        self._cancel_stop_loss_timer()
+        
+        try:
+            if sell_fn:
+                success = await sell_fn(leg1.token_id, leg1.shares)
+            else:
+                # Create signal for external execution
+                signal = DipArbSignal(
+                    signal_type='emergency_exit',
+                    side=leg1.side,
+                    token_id=leg1.token_id,
+                    target_price=0,  # Market sell
+                    current_price=0,
+                    shares=leg1.shares,
+                    reason="Emergency exit requested",
+                    expected_profit=-(leg1.price * leg1.shares),
+                    round_id=self._current_round.round_id,
+                    is_sell=True
+                )
+                self._emit_signal(signal)
+                success = True
+            
+            if success:
+                self._stats.emergency_exits += 1
+                self._current_round.phase = DipArbPhase.STOP_LOSS
+                self._reset_round()
+                logger.info(f"✅ Emergency exit executed")
+                return {'success': True, 'shares_sold': leg1.shares}
+            else:
+                return {'success': False, 'error': 'Sell failed'}
+                
+        except Exception as e:
+            logger.error(f"Emergency exit error: {e}")
+            return {'success': False, 'error': str(e)}
     
     # =========================================================================
     # Stop Loss
