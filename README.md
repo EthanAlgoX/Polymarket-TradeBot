@@ -1,123 +1,188 @@
-# Polymarket Copy Trading Bot
+# Polymarket Arbitrage Trading Bot
 
-> Automated copy trading bot for Polymarket that mirrors trades from top performers with intelligent position sizing and real-time execution.
+> Advanced arbitrage and copy trading bot for Polymarket with real-time WebSocket monitoring, smart money tracking, and intelligent rebalancing.
 
 [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
-[![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
+[![Python Version](https://img.shields.io/badge/python-%3E%3D3.10-brightgreen.svg)](https://python.org/)
 
 ## Overview
 
-The Polymarket Copy Trading Bot automatically replicates trades from successful Polymarket traders to your wallet. It monitors trader activity 24/7, calculates proportional position sizes based on your capital, and executes matching orders in real-time.
+The Polymarket Arbitrage Bot detects and executes arbitrage opportunities on Polymarket prediction markets. It uses **correct effective price calculation** to handle Polymarket's mirror orderbook property and integrates multiple trading strategies.
 
-### How It Works
-<img width="995" height="691" alt="screenshot" src="https://github.com/user-attachments/assets/79715c7a-de2c-4033-81e6-b2288963ec9b" />
+### Key Features
 
-1. **Select Traders** - Choose top performers from [Polymarket leaderboard](https://polymarket.com/leaderboard) or [Predictfolio](https://predictfolio.com)
-2. **Monitor Activity** - Bot continuously watches for new positions opened by selected traders using Polymarket Data API
-3. **Calculate Size** - Automatically scales trades based on your balance vs. trader's balance
-4. **Execute Orders** - Places matching orders on Polymarket using your wallet
-5. **Track Performance** - Maintains complete trade history in MongoDB
+| Feature | Description |
+|---------|-------------|
+| 🎯 **Arbitrage Detection** | Effective price calculation for accurate opportunity detection |
+| ⚡ **Real-time WebSocket** | Live orderbook updates via Polymarket WebSocket API |
+| 🧠 **Smart Money Tracking** | Monitor and copy top performer trades |
+| ⚖️ **Auto Rebalancing** | Automatic USDC/token ratio management |
+| 📊 **DipArb Strategy** | 15-minute crypto UP/DOWN market arbitrage |
+| 📈 **Momentum Strategy** | Technical indicator-based trading |
 
 ## Quick Start
 
 ### Prerequisites
 
-- Node.js v18+
-- MongoDB database ([MongoDB Atlas](https://www.mongodb.com/cloud/atlas/register) free tier works)
-- Polygon wallet with USDC and POL/MATIC for gas
-- RPC endpoint ([Infura](https://infura.io) or [Alchemy](https://www.alchemy.com) free tier)
+- Python 3.10+
+- Polygon wallet with USDC
+- Polymarket API keys
 
 ### Installation
 
 ```bash
 # Clone repository
-git clone https://github.com/vladmeer/polymarket-copy-trading-bot.git
-cd polymarket-copy-trading-bot
+git clone https://github.com/EthanAlgoX/Polymarket-TradeBot.git
+cd Polymarket-TradeBot/agents-main
 
 # Install dependencies
-npm install
+pip install -r requirements.txt
 
-# Run interactive setup wizard
-npm run setup
+# Configure environment
+cp .env.example .env
+# Edit .env with your API keys
 
-# Build and start
-npm run build
-npm run health-check  # Verify configuration
-npm start             # Start trading
+# Run the bot
+python -m agents.arbitrage.main
 ```
 
-**📖 For detailed setup instructions, see [Getting Started Guide](./docs/GETTING_STARTED.md)**
+**📖 For detailed setup, see [SETUP_CREDENTIALS.md](./SETUP_CREDENTIALS.md)**
 
-## Features
+## Architecture
 
-- **Multi-Trader Support** - Track and copy trades from multiple traders simultaneously
-- **Smart Position Sizing** - Automatically adjusts trade sizes based on your capital
-- **Tiered Multipliers** - Apply different multipliers based on trade size
-- **Position Tracking** - Accurately tracks purchases and sells even after balance changes
-- **Trade Aggregation** - Combines multiple small trades into larger executable orders
-- **Real-time Execution** - Monitors trades every second and executes instantly
-- **MongoDB Integration** - Persistent storage of all trades and positions
-- **Price Protection** - Built-in slippage checks to avoid unfavorable fills
+```
+agents-main/
+├── agents/arbitrage/
+│   ├── main.py              # Main bot runner
+│   ├── strategy.py          # Arbitrage strategy (effective prices)
+│   ├── price_utils.py       # Effective price calculation
+│   ├── realtime_service.py  # WebSocket real-time service
+│   ├── smart_money_service.py  # Smart money tracking
+│   ├── rebalancer.py        # USDC/token rebalancing
+│   ├── dip_arb.py           # DipArb strategy
+│   ├── market_scanner.py    # Market discovery
+│   └── strategies/
+│       └── momentum_strategy.py
+```
 
-### Monitoring Method
+## Core Modules
 
-The bot currently uses the **Polymarket Data API** to monitor trader activity and detect new positions. The monitoring system polls trader positions at configurable intervals (default: 1 second) to ensure timely trade detection and execution.
+### 1. Effective Price Calculation (`price_utils.py`)
+
+Correctly handles Polymarket's **mirror orderbook property**:
+
+```python
+from agents.arbitrage.price_utils import get_effective_prices, check_arbitrage
+
+# Polymarket key property: Buy YES @ P = Sell NO @ (1-P)
+eff = get_effective_prices(yes_ask, yes_bid, no_ask, no_bid)
+
+# Correct arbitrage calculation
+arb = check_arbitrage(yes_ask, yes_bid, no_ask, no_bid, threshold=0.003)
+if arb:
+    print(f"Arbitrage: {arb.profit_percent:.2f}%")
+```
+
+### 2. WebSocket Real-time Service (`realtime_service.py`)
+
+```python
+from agents.arbitrage.realtime_service import RealtimeService
+
+service = RealtimeService()
+service.connect()
+service.subscribe_market(["token_id_yes", "token_id_no"])
+service.on('orderbook', lambda ob: print(f"Bid: {ob.best_bid}"))
+```
+
+### 3. Smart Money Service (`smart_money_service.py`)
+
+```python
+from agents.arbitrage.smart_money_service import SmartMoneyService
+
+service = SmartMoneyService()
+await service.initialize()
+
+# Get top traders
+traders = await service.get_smart_money_list(50)
+print(f"Top trader: {traders[0].name} PnL=${traders[0].pnl:,.0f}")
+
+# Auto copy trading (dry run)
+sub = await service.start_auto_copy_trading(
+    top_n=50,
+    size_scale=0.1,
+    max_size_per_trade=10,
+    dry_run=True
+)
+```
+
+### 4. Rebalancer (`rebalancer.py`)
+
+```python
+from agents.arbitrage.rebalancer import Rebalancer
+
+rebalancer = Rebalancer(
+    min_usdc_ratio=0.2,
+    max_usdc_ratio=0.8,
+    target_usdc_ratio=0.5
+)
+
+action = rebalancer.calculate_action(usdc=100, yes_tokens=80, no_tokens=50)
+if action.is_needed:
+    print(f"Action: {action.type.value} ${action.amount:.2f}")
+```
+
+### 5. DipArb Strategy (`dip_arb.py`)
+
+For 15-minute crypto UP/DOWN markets:
+
+```python
+from agents.arbitrage.dip_arb import DipArbStrategy, analyze_dip_arb
+
+# Quick analysis
+result = analyze_dip_arb(up_ask=0.47, down_ask=0.48)
+print(f"Profit: {result['profit_pct']}")  # 5.26%
+```
 
 ## Configuration
 
-### Essential Variables
+### Environment Variables
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `USER_ADDRESSES` | Traders to copy (comma-separated) | `'0xABC..., 0xDEF...'` |
-| `PROXY_WALLET` | Your Polygon wallet address | `'0x123...'` |
-| `PRIVATE_KEY` | Wallet private key (no 0x prefix) | `'abc123...'` |
-| `MONGO_URI` | MongoDB connection string | `'mongodb+srv://...'` |
-| `RPC_URL` | Polygon RPC endpoint | `'https://polygon...'` |
-| `TRADE_MULTIPLIER` | Position size multiplier (default: 1.0) | `2.0` |
-| `FETCH_INTERVAL` | Check interval in seconds (default: 1) | `1` |
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `POLY_API_KEY` | Polymarket API Key | ✅ |
+| `POLY_API_SECRET` | Polymarket API Secret | ✅ |
+| `POLY_PASSPHRASE` | Polymarket Passphrase | ✅ |
+| `PRIVATE_KEY` | Wallet private key | ✅ |
+| `PAPER_TRADING` | Enable paper trading mode | Optional |
 
-### Finding Traders
+### Bot Configuration (`config.py`)
 
-1. Visit [Polymarket Leaderboard](https://polymarket.com/leaderboard)
-2. Look for traders with positive P&L, win rate >55%, and active trading history
-3. Verify detailed stats on [Predictfolio](https://predictfolio.com)
-4. Add wallet addresses to `USER_ADDRESSES`
+```python
+# Minimum profit threshold for arbitrage
+MIN_PROFIT_SPREAD = 0.003  # 0.3%
 
-**📖 For complete configuration guide, see [Quick Start](./docs/QUICK_START.md)**
+# Risk management
+MAX_DAILY_TRADES = 100
+MAX_POSITION_SIZE = 50  # USDC
+```
 
-## Documentation
+## Monitoring
 
-### Getting Started
-- **[🚀 Getting Started Guide](./docs/GETTING_STARTED.md)** - Complete beginner's guide
-- **[⚡ Quick Start](./docs/QUICK_START.md)** - Fast setup for experienced users
+```bash
+# View real-time logs
+tail -f agents/arbitrage/logs/bot_$(date +%Y%m%d).log
+
+# Check process
+pgrep -f "agents.arbitrage.main"
+
+# Stop bot
+pkill -f "agents.arbitrage.main"
+```
 
 ## License
 
 ISC License - See [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
-
-- Built on [Polymarket CLOB Client](https://github.com/Polymarket/clob-client)
-- Uses [Predictfolio](https://predictfolio.com) for trader analytics
-- Powered by Polygon network
-
 ---
 
-## Advanced version
-
-**🚀 Version 2 Available:** An advanced version with **RTDS (Real-Time Data Stream)** monitoring is now available as a private repository. <br />
-Version 2 features the fastest trade detection method with near-instantaneous trade replication, lower latency, and reduced API load. Copy trading works excellently in the advanced version.
-
-<img width="680" height="313" alt="image (19)" src="https://github.com/user-attachments/assets/d868f9f2-a1dd-4bfe-a76e-d8cbdfbd8497" />
-
-## Trading tool
-
-I've also developed a trading bot for Polymarket built with **Rust**.
-
-<img width="1917" height="942" alt="image (21)" src="https://github.com/user-attachments/assets/08a5c962-7f8b-4097-98b6-7a457daa37c9" />
-https://www.youtube.com/watch?v=4f6jHT4-DQs
-
-**Disclaimer:** This software is for educational purposes only. Trading involves risk of loss. The developers are not responsible for any financial losses incurred while using this bot.
-
-**Support:** For questions or issues, contact via Telegram: [@Vladmeer](https://t.me/vladmeer67) | Twitter: [@Vladmeer](https://x.com/vladmeer67)
+**⚠️ Disclaimer:** This software is for educational purposes only. Trading involves risk of loss. The developers are not responsible for any financial losses incurred while using this bot.
