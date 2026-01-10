@@ -19,6 +19,9 @@ import asyncio
 from typing import List, Optional
 
 # Import our modular components
+# Version tracking
+VERSION = "v20260110_1"
+
 from agents.arbitrage.config import (
     POLL_INTERVAL, PAPER_TRADING, MOMENTUM_ENABLED,
     TARGET_TRADERS, MARKET_SCAN_INTERVAL
@@ -382,7 +385,7 @@ def main():
     global bot
     
     logger.info("=" * 50)
-    logger.info("POLYMARKET ARBITRAGE BOT")
+    logger.info(f"POLYMARKET ARBITRAGE BOT {VERSION}")
     logger.info("=" * 50)
     
     # Register signal handlers
