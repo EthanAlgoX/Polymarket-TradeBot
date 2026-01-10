@@ -1,47 +1,43 @@
 """
-DipArb Strategy Service for Polymarket
+Enhanced DipArb Strategy Service for Polymarket
 
-Based on poly-sdk-main/src/services/dip-arb-service.ts
-
-DipArb (Dip Arbitrage) targets Polymarket's 15-minute crypto UP/DOWN markets.
+15-Minute Crypto Market Arbitrage Strategy
 
 Strategy Logic:
-1. Each market has a "price to beat" (Chainlink price at market open)
-2. Settlement rules:
-   - UP wins: ending price >= price to beat
-   - DOWN wins: ending price < price to beat
-3. Arbitrage flow:
-   - Leg1: Detect dip → buy dipping side
-   - Leg2: Wait for hedge opportunity → buy other side
-   - Profit: If total cost < $1, guaranteed profit at settlement
+1. Leg1: Detect 30% dip within 3s sliding window → buy dipping side
+2. Leg2: Wait for sum_target (0.95u) → buy other side for guaranteed profit
+3. Stop Loss: If leg2 not executed within timeout, sell leg1
+4. Auto Merge: After leg2, merge UP+DOWN → USDC.e
+5. Market Rotation: Auto switch to next 15-min market after resolution
 
-Usage:
-    from agents.arbitrage.dip_arb import DipArbStrategy, DipArbSignal
-    
-    strategy = DipArbStrategy(
-        min_profit_rate=0.02,  # 2% minimum profit
-        dip_threshold=0.05     # 5% price dip threshold
-    )
-    
-    signal = strategy.analyze(up_ask=0.52, down_ask=0.45)
-    if signal:
-        print(f"Signal: {signal.signal_type} {signal.side}")
+Configuration:
+    sliding_window_ms: 3000   # 3s window for dip detection
+    dip_threshold: 0.30       # 30% crash threshold
+    sum_target: 0.95          # Total cost target for both legs
+    leg2_timeout_seconds: 100 # Sell leg1 if no leg2 within timeout
+    auto_merge: True          # Merge after leg2 completion
+    split_orders: 1           # Split large orders
 """
 
+import asyncio
 import logging
 import time
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import deque
 
 logger = logging.getLogger("DipArb")
 
 
 class DipArbPhase(Enum):
     """DipArb round phases."""
-    WAITING = "waiting"        # Waiting for dip opportunity
-    LEG1_FILLED = "leg1_filled"  # Leg1 executed, waiting for hedge
-    COMPLETED = "completed"    # Both legs filled
+    WAITING = "waiting"           # Waiting for dip opportunity
+    LEG1_PENDING = "leg1_pending" # Leg1 signal emitted, awaiting fill
+    LEG1_FILLED = "leg1_filled"   # Leg1 executed, waiting for hedge
+    LEG2_PENDING = "leg2_pending" # Leg2 signal emitted, awaiting fill
+    COMPLETED = "completed"       # Both legs filled
+    STOP_LOSS = "stop_loss"       # Leg1 sold due to timeout
 
 
 class DipArbSide(Enum):
@@ -51,9 +47,49 @@ class DipArbSide(Enum):
 
 
 @dataclass
+class DipArbConfig:
+    """Enhanced DipArb configuration."""
+    # Leg1: Sliding window dip detection
+    sliding_window_ms: int = 3000     # 3s window
+    dip_threshold: float = 0.30       # 30% crash threshold
+    
+    # Leg2: Sum target
+    sum_target: float = 0.95          # Buy both for 0.95u total
+    
+    # Stop loss
+    leg2_timeout_seconds: int = 100   # Sell leg1 if no leg2 within timeout
+    enable_stop_loss: bool = True
+    
+    # Auto merge
+    auto_merge: bool = True           # Merge after leg2
+    
+    # Order splitting
+    split_orders: int = 1             # Split into N orders
+    order_interval_ms: int = 100      # Delay between split orders
+    
+    # Position sizing
+    position_size: float = 10.0       # USDC per trade
+    min_order_size: float = 1.0       # Minimum order size
+    
+    # Other
+    execution_cooldown: float = 1.0   # Seconds between executions
+    debug: bool = False
+
+
+@dataclass
+class PricePoint:
+    """Single price observation."""
+    timestamp: float  # Unix timestamp in seconds
+    up_ask: float
+    down_ask: float
+    up_bid: float = 0.0
+    down_bid: float = 0.0
+
+
+@dataclass
 class DipArbSignal:
     """Trading signal for DipArb strategy."""
-    signal_type: str  # 'leg1' or 'leg2'
+    signal_type: str  # 'leg1', 'leg2', 'stop_loss'
     side: DipArbSide
     token_id: str
     target_price: float
@@ -62,6 +98,7 @@ class DipArbSignal:
     reason: str
     expected_profit: float
     round_id: str
+    is_sell: bool = False  # True for stop loss sell
     timestamp: float = field(default_factory=time.time)
 
 
@@ -73,6 +110,7 @@ class DipArbLeg:
     shares: float
     timestamp: float
     token_id: str
+    order_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -83,8 +121,11 @@ class DipArbRoundState:
     start_time: float
     leg1: Optional[DipArbLeg] = None
     leg2: Optional[DipArbLeg] = None
+    leg1_fill_time: Optional[float] = None
     total_cost: float = 0.0
     profit: float = 0.0
+    merged: bool = False
+    stop_loss_triggered: bool = False
 
 
 @dataclass
@@ -98,6 +139,7 @@ class DipArbMarketConfig:
     duration_minutes: int  # 5 or 15
     end_time: Optional[float] = None
     slug: Optional[str] = None
+    price_to_beat: Optional[float] = None
 
 
 @dataclass
@@ -106,189 +148,507 @@ class DipArbStats:
     start_time: float = field(default_factory=time.time)
     rounds_monitored: int = 0
     rounds_successful: int = 0
+    rounds_stop_loss: int = 0
     leg1_filled: int = 0
     leg2_filled: int = 0
+    merges_completed: int = 0
     total_profit: float = 0.0
     total_spent: float = 0.0
+    total_stop_loss: float = 0.0
+    markets_rotated: int = 0
     running_time_ms: float = 0
 
 
-class DipArbStrategy:
+class DipArbService:
     """
-    DipArb Strategy for 15-minute crypto markets.
+    Enhanced DipArb Service for 15-minute crypto markets.
     
-    Monitors UP/DOWN token orderbooks and generates signals when:
-    - Leg1: One side dips significantly (opportunity to buy cheap)
-    - Leg2: Other side available at price that makes total < $1
+    Features:
+    - Sliding window dip detection (3s, 30%)
+    - Stop loss mechanism
+    - Auto merge after leg2
+    - Market rotation
+    - Order splitting
     """
     
-    def __init__(
-        self,
-        min_profit_rate: float = 0.02,      # 2% minimum profit
-        dip_threshold: float = 0.05,         # 5% dip threshold
-        max_total_cost: float = 0.98,        # Max total cost for both legs
-        position_size: float = 10.0,         # Position size in USDC
-        execution_cooldown: float = 5.0,     # Seconds between executions
-        debug: bool = False
-    ):
-        self.min_profit_rate = min_profit_rate
-        self.dip_threshold = dip_threshold
-        self.max_total_cost = max_total_cost
-        self.position_size = position_size
-        self.execution_cooldown = execution_cooldown
-        self.debug = debug
+    VERSION = "v20260111_1"
+    
+    def __init__(self, config: Optional[DipArbConfig] = None):
+        self.config = config or DipArbConfig()
         
         # State
         self._current_round: Optional[DipArbRoundState] = None
-        self._stats = DipArbStats()
-        self._last_execution_time: float = 0
-        self._round_counter: int = 0
-        
-        # Price history for dip detection
-        self._price_history: List[Dict] = []
-        self._max_history_length = 100
-        
-        # Market config
         self._market: Optional[DipArbMarketConfig] = None
+        self._stats = DipArbStats()
+        self._round_counter: int = 0
+        self._last_execution_time: float = 0
+        self._is_running: bool = False
         
-        # Signal handlers
+        # Price history with sliding window
+        self._price_history: deque = deque(maxlen=1000)
+        
+        # Callbacks
         self._on_signal: Optional[Callable[[DipArbSignal], None]] = None
+        self._on_merge: Optional[Callable[[str, float], None]] = None
+        self._on_market_rotate: Optional[Callable[[DipArbMarketConfig], None]] = None
+        
+        # Background tasks
+        self._stop_loss_task: Optional[asyncio.Task] = None
+        
+        logger.info(f"DipArbService {self.VERSION} initialized")
+        logger.info(f"Config: window={self.config.sliding_window_ms}ms, dip={self.config.dip_threshold*100:.0f}%, target={self.config.sum_target}")
+    
+    # =========================================================================
+    # Configuration
+    # =========================================================================
+    
+    def update_config(self, **kwargs):
+        """Update configuration parameters."""
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                logger.info(f"Config updated: {key}={value}")
+    
+    # =========================================================================
+    # Event Handlers
+    # =========================================================================
     
     def on_signal(self, handler: Callable[[DipArbSignal], None]):
         """Register signal handler."""
         self._on_signal = handler
     
+    def on_merge(self, handler: Callable[[str, float], None]):
+        """Register merge completion handler."""
+        self._on_merge = handler
+    
+    def on_market_rotate(self, handler: Callable[[DipArbMarketConfig], None]):
+        """Register market rotation handler."""
+        self._on_market_rotate = handler
+    
+    # =========================================================================
+    # Market Management
+    # =========================================================================
+    
     def set_market(self, market: DipArbMarketConfig):
-        """Set market configuration."""
+        """Set current market configuration."""
         self._market = market
         self._reset_round()
+        self._price_history.clear()
+        logger.info(f"Market set: {market.name} ({market.underlying} {market.duration_minutes}m)")
     
-    def analyze(
+    async def rotate_to_next_market(self, next_market: DipArbMarketConfig):
+        """
+        Rotate to next 15-minute market.
+        
+        Called when current market ends or resolves.
+        """
+        # Handle any pending positions
+        if self._current_round and self._current_round.phase == DipArbPhase.LEG1_FILLED:
+            logger.warning("Market ending with open leg1 position - will be redeemed after resolution")
+        
+        self._stats.markets_rotated += 1
+        self.set_market(next_market)
+        
+        if self._on_market_rotate:
+            self._on_market_rotate(next_market)
+        
+        logger.info(f"Rotated to market: {next_market.name}")
+    
+    # =========================================================================
+    # Price Analysis
+    # =========================================================================
+    
+    def update_prices(
         self,
         up_ask: float,
         down_ask: float,
-        up_bid: float = 0,
-        down_bid: float = 0,
+        up_bid: float = 0.0,
+        down_bid: float = 0.0,
         timestamp: Optional[float] = None
     ) -> Optional[DipArbSignal]:
         """
-        Analyze current prices and generate signal if opportunity exists.
+        Update price data and check for signals.
         
-        Args:
-            up_ask: Best ask price for UP token
-            down_ask: Best ask price for DOWN token
-            up_bid: Best bid price for UP token (optional)
-            down_bid: Best bid price for DOWN token (optional)
-            timestamp: Current timestamp (optional)
-        
-        Returns:
-            DipArbSignal if opportunity exists, None otherwise
+        This is the main entry point - call this with each orderbook update.
         """
         ts = timestamp or time.time()
         
-        # Update price history
-        self._update_price_history(up_ask, down_ask, ts)
+        # Record price point
+        price_point = PricePoint(
+            timestamp=ts,
+            up_ask=up_ask,
+            down_ask=down_ask,
+            up_bid=up_bid,
+            down_bid=down_bid
+        )
+        self._price_history.append(price_point)
         
         # Check execution cooldown
-        if (ts - self._last_execution_time) < self.execution_cooldown:
+        if (ts - self._last_execution_time) < self.config.execution_cooldown:
             return None
         
-        # Get current round or create new one
+        # Ensure we have a round
         if self._current_round is None:
             self._start_new_round()
         
-        # Analyze based on current phase
+        # Analyze based on phase
+        signal = None
+        
         if self._current_round.phase == DipArbPhase.WAITING:
-            return self._check_leg1_opportunity(up_ask, down_ask, ts)
+            signal = self._check_leg1_opportunity(up_ask, down_ask, up_bid, down_bid, ts)
         
         elif self._current_round.phase == DipArbPhase.LEG1_FILLED:
-            return self._check_leg2_opportunity(up_ask, down_ask, ts)
+            signal = self._check_leg2_opportunity(up_ask, down_ask, ts)
+        
+        return signal
+    
+    def _detect_sliding_window_dip(self, side: DipArbSide, current_ts: float) -> Optional[float]:
+        """
+        Detect dip within sliding window.
+        
+        Returns dip percentage if detected, None otherwise.
+        """
+        window_start = current_ts - (self.config.sliding_window_ms / 1000.0)
+        
+        # Get prices within window
+        key = 'up_ask' if side == DipArbSide.UP else 'down_ask'
+        
+        window_prices = []
+        for p in self._price_history:
+            if p.timestamp >= window_start:
+                price = getattr(p, key)
+                if price > 0:
+                    window_prices.append((p.timestamp, price))
+        
+        if len(window_prices) < 2:
+            return None
+        
+        # Find max price in window (before current)
+        max_price = 0
+        current_price = window_prices[-1][1]
+        
+        for ts, price in window_prices[:-1]:
+            if price > max_price:
+                max_price = price
+        
+        if max_price == 0:
+            return None
+        
+        # Calculate dip percentage
+        dip_pct = (max_price - current_price) / max_price
+        
+        if dip_pct >= self.config.dip_threshold:
+            logger.info(
+                f"🔥 DIP DETECTED: {side.value} dropped {dip_pct*100:.1f}% "
+                f"({max_price:.4f} → {current_price:.4f}) in {self.config.sliding_window_ms}ms"
+            )
+            return dip_pct
         
         return None
     
-    def record_execution(self, signal: DipArbSignal, price: float, shares: float):
-        """
-        Record successful execution.
+    def _check_leg1_opportunity(
+        self,
+        up_ask: float,
+        down_ask: float,
+        up_bid: float,
+        down_bid: float,
+        ts: float
+    ) -> Optional[DipArbSignal]:
+        """Check for Leg1 dip opportunity using sliding window."""
         
-        Args:
-            signal: The signal that was executed
-            price: Actual execution price
-            shares: Shares filled
-        """
+        # Check UP dip
+        up_dip = self._detect_sliding_window_dip(DipArbSide.UP, ts)
+        if up_dip is not None:
+            total_cost = up_ask + down_ask
+            if total_cost <= self.config.sum_target:
+                return self._create_leg1_signal(DipArbSide.UP, up_ask, total_cost, up_dip)
+            else:
+                # Still buy on dip even if sum not yet at target
+                # Leg2 will wait for price to come down
+                return self._create_leg1_signal(DipArbSide.UP, up_ask, total_cost, up_dip)
+        
+        # Check DOWN dip
+        down_dip = self._detect_sliding_window_dip(DipArbSide.DOWN, ts)
+        if down_dip is not None:
+            total_cost = up_ask + down_ask
+            if total_cost <= self.config.sum_target:
+                return self._create_leg1_signal(DipArbSide.DOWN, down_ask, total_cost, down_dip)
+            else:
+                return self._create_leg1_signal(DipArbSide.DOWN, down_ask, total_cost, down_dip)
+        
+        return None
+    
+    def _create_leg1_signal(
+        self,
+        side: DipArbSide,
+        price: float,
+        total_cost: float,
+        dip_pct: float
+    ) -> DipArbSignal:
+        """Create Leg1 buy signal."""
+        token_id = ""
+        if self._market:
+            token_id = self._market.up_token_id if side == DipArbSide.UP else self._market.down_token_id
+        
+        shares = self.config.position_size / price if price > 0 else 0
+        expected_profit = (1.0 - self.config.sum_target) * shares
+        
+        signal = DipArbSignal(
+            signal_type='leg1',
+            side=side,
+            token_id=token_id,
+            target_price=price,
+            current_price=price,
+            shares=shares,
+            reason=f"{side.value} dip {dip_pct*100:.1f}% in {self.config.sliding_window_ms}ms",
+            expected_profit=expected_profit,
+            round_id=self._current_round.round_id if self._current_round else "unknown"
+        )
+        
+        self._emit_signal(signal)
+        return signal
+    
+    def _check_leg2_opportunity(
+        self,
+        up_ask: float,
+        down_ask: float,
+        ts: float
+    ) -> Optional[DipArbSignal]:
+        """Check for Leg2 hedge opportunity based on sum_target."""
+        if not self._current_round or not self._current_round.leg1:
+            return None
+        
+        leg1 = self._current_round.leg1
+        
+        # Determine hedge side
+        if leg1.side == DipArbSide.UP:
+            hedge_side = DipArbSide.DOWN
+            hedge_price = down_ask
+        else:
+            hedge_side = DipArbSide.UP
+            hedge_price = up_ask
+        
+        # Calculate total cost
+        total_cost = leg1.price + hedge_price
+        
+        # Check if sum_target met
+        if total_cost <= self.config.sum_target:
+            profit = 1.0 - total_cost
+            
+            token_id = ""
+            if self._market:
+                token_id = self._market.up_token_id if hedge_side == DipArbSide.UP else self._market.down_token_id
+            
+            signal = DipArbSignal(
+                signal_type='leg2',
+                side=hedge_side,
+                token_id=token_id,
+                target_price=hedge_price,
+                current_price=hedge_price,
+                shares=leg1.shares,  # Match leg1 shares
+                reason=f"Sum target met: {total_cost:.4f} <= {self.config.sum_target}",
+                expected_profit=profit * leg1.shares,
+                round_id=self._current_round.round_id
+            )
+            
+            self._emit_signal(signal)
+            return signal
+        
+        return None
+    
+    # =========================================================================
+    # Execution Recording
+    # =========================================================================
+    
+    def record_leg1_fill(self, signal: DipArbSignal, price: float, shares: float, order_ids: List[str] = None):
+        """Record Leg1 fill and start stop loss timer."""
         if self._current_round is None:
             return
         
-        leg = DipArbLeg(
+        self._current_round.leg1 = DipArbLeg(
             side=signal.side,
             price=price,
             shares=shares,
             timestamp=time.time(),
-            token_id=signal.token_id
+            token_id=signal.token_id,
+            order_ids=order_ids or []
         )
+        self._current_round.phase = DipArbPhase.LEG1_FILLED
+        self._current_round.leg1_fill_time = time.time()
+        self._stats.leg1_filled += 1
+        self._last_execution_time = time.time()
         
-        if signal.signal_type == 'leg1':
-            self._current_round.leg1 = leg
-            self._current_round.phase = DipArbPhase.LEG1_FILLED
-            self._stats.leg1_filled += 1
-            logger.info(f"Leg1 recorded: {signal.side.value} @ {price:.4f}")
-            
-        elif signal.signal_type == 'leg2':
-            self._current_round.leg2 = leg
-            self._current_round.phase = DipArbPhase.COMPLETED
-            self._stats.leg2_filled += 1
-            
-            # Calculate profit
-            leg1_price = self._current_round.leg1.price if self._current_round.leg1 else 0
-            self._current_round.total_cost = leg1_price + price
-            self._current_round.profit = 1.0 - self._current_round.total_cost
-            
-            self._stats.rounds_successful += 1
-            self._stats.total_profit += self._current_round.profit * shares
-            self._stats.total_spent += self._current_round.total_cost * shares
-            
-            logger.info(
-                f"Round complete! Cost: {self._current_round.total_cost:.4f}, "
-                f"Profit: ${self._current_round.profit * shares:.2f}"
-            )
-            
-            # Start new round
-            self._reset_round()
+        logger.info(f"✅ Leg1 FILLED: {signal.side.value} x{shares:.2f} @ {price:.4f}")
+        
+        # Start stop loss timer
+        if self.config.enable_stop_loss:
+            self._start_stop_loss_timer()
+    
+    def record_leg2_fill(self, signal: DipArbSignal, price: float, shares: float, order_ids: List[str] = None):
+        """Record Leg2 fill and trigger auto merge."""
+        if self._current_round is None or self._current_round.leg1 is None:
+            return
+        
+        # Cancel stop loss timer
+        self._cancel_stop_loss_timer()
+        
+        self._current_round.leg2 = DipArbLeg(
+            side=signal.side,
+            price=price,
+            shares=shares,
+            timestamp=time.time(),
+            token_id=signal.token_id,
+            order_ids=order_ids or []
+        )
+        self._current_round.phase = DipArbPhase.COMPLETED
+        
+        # Calculate profit
+        leg1_price = self._current_round.leg1.price
+        self._current_round.total_cost = leg1_price + price
+        self._current_round.profit = 1.0 - self._current_round.total_cost
+        
+        self._stats.leg2_filled += 1
+        self._stats.rounds_successful += 1
+        self._stats.total_profit += self._current_round.profit * shares
+        self._stats.total_spent += self._current_round.total_cost * shares
         
         self._last_execution_time = time.time()
+        
+        logger.info(
+            f"✅ Leg2 FILLED: {signal.side.value} x{shares:.2f} @ {price:.4f}\n"
+            f"   💰 Round Complete! Cost: {self._current_round.total_cost:.4f}, "
+            f"Profit: ${self._current_round.profit * shares:.2f}"
+        )
+        
+        # Trigger auto merge
+        if self.config.auto_merge:
+            asyncio.create_task(self._execute_merge())
+        else:
+            self._reset_round()
     
-    def get_stats(self) -> DipArbStats:
-        """Get current statistics."""
-        self._stats.running_time_ms = (time.time() - self._stats.start_time) * 1000
-        return self._stats
-    
-    def get_current_round(self) -> Optional[DipArbRoundState]:
-        """Get current round state."""
-        return self._current_round
-    
-    def get_status(self) -> Dict:
-        """Get current strategy status."""
-        return {
-            'market': self._market.name if self._market else None,
-            'round_id': self._current_round.round_id if self._current_round else None,
-            'phase': self._current_round.phase.value if self._current_round else 'idle',
-            'leg1': {
-                'side': self._current_round.leg1.side.value,
-                'price': self._current_round.leg1.price
-            } if self._current_round and self._current_round.leg1 else None,
-            'stats': {
-                'rounds_successful': self._stats.rounds_successful,
-                'total_profit': self._stats.total_profit,
-                'leg1_filled': self._stats.leg1_filled,
-                'leg2_filled': self._stats.leg2_filled
-            }
-        }
+    async def _execute_merge(self):
+        """Execute auto merge after leg2."""
+        if not self._current_round or not self._market:
+            return
+        
+        shares = self._current_round.leg1.shares if self._current_round.leg1 else 0
+        
+        logger.info(f"🔄 Auto merging {shares:.2f} pairs → USDC.e...")
+        
+        # Call merge handler if registered
+        if self._on_merge:
+            try:
+                self._on_merge(self._market.condition_id, shares)
+                self._current_round.merged = True
+                self._stats.merges_completed += 1
+                logger.info(f"✅ Merge completed: {shares:.2f} → ${shares:.2f} USDC.e")
+            except Exception as e:
+                logger.error(f"Merge failed: {e}")
+        
+        self._reset_round()
     
     # =========================================================================
-    # Internal Methods
+    # Stop Loss
+    # =========================================================================
+    
+    def _start_stop_loss_timer(self):
+        """Start background timer for stop loss."""
+        if self._stop_loss_task:
+            self._stop_loss_task.cancel()
+        
+        self._stop_loss_task = asyncio.create_task(self._stop_loss_countdown())
+    
+    def _cancel_stop_loss_timer(self):
+        """Cancel stop loss timer."""
+        if self._stop_loss_task:
+            self._stop_loss_task.cancel()
+            self._stop_loss_task = None
+    
+    async def _stop_loss_countdown(self):
+        """Background task for stop loss timeout."""
+        try:
+            await asyncio.sleep(self.config.leg2_timeout_seconds)
+            
+            # Check if still in leg1_filled state
+            if self._current_round and self._current_round.phase == DipArbPhase.LEG1_FILLED:
+                await self._trigger_stop_loss()
+        except asyncio.CancelledError:
+            pass  # Timer was cancelled (leg2 filled)
+    
+    async def _trigger_stop_loss(self):
+        """Trigger stop loss - sell leg1 position."""
+        if not self._current_round or not self._current_round.leg1:
+            return
+        
+        leg1 = self._current_round.leg1
+        
+        logger.warning(
+            f"⚠️ STOP LOSS TRIGGERED: {self.config.leg2_timeout_seconds}s timeout\n"
+            f"   Selling {leg1.shares:.2f} {leg1.side.value} tokens"
+        )
+        
+        # Create stop loss sell signal
+        signal = DipArbSignal(
+            signal_type='stop_loss',
+            side=leg1.side,
+            token_id=leg1.token_id,
+            target_price=0,  # Market sell
+            current_price=0,
+            shares=leg1.shares,
+            reason=f"Leg2 timeout after {self.config.leg2_timeout_seconds}s",
+            expected_profit=-leg1.price * leg1.shares,  # Expect loss
+            round_id=self._current_round.round_id,
+            is_sell=True
+        )
+        
+        self._current_round.phase = DipArbPhase.STOP_LOSS
+        self._current_round.stop_loss_triggered = True
+        self._stats.rounds_stop_loss += 1
+        self._stats.total_stop_loss += leg1.price * leg1.shares
+        
+        self._emit_signal(signal)
+        self._reset_round()
+    
+    # =========================================================================
+    # Order Splitting
+    # =========================================================================
+    
+    def calculate_split_orders(self, total_shares: float, price: float) -> List[Dict]:
+        """
+        Calculate how to split a large order.
+        
+        Returns list of order specs with shares and size.
+        """
+        if self.config.split_orders <= 1:
+            return [{'shares': total_shares, 'size': total_shares * price}]
+        
+        shares_per_order = total_shares / self.config.split_orders
+        
+        orders = []
+        for i in range(self.config.split_orders):
+            order_shares = shares_per_order
+            order_size = order_shares * price
+            
+            # Ensure minimum order size
+            if order_size < self.config.min_order_size:
+                order_size = self.config.min_order_size
+                order_shares = order_size / price
+            
+            orders.append({
+                'index': i + 1,
+                'shares': order_shares,
+                'size': order_size,
+                'delay_ms': i * self.config.order_interval_ms
+            })
+        
+        return orders
+    
+    # =========================================================================
+    # Helper Methods
     # =========================================================================
     
     def _start_new_round(self):
-        """Start a new round."""
+        """Start a new trading round."""
         self._round_counter += 1
         self._current_round = DipArbRoundState(
             round_id=f"round_{self._round_counter}",
@@ -299,154 +659,8 @@ class DipArbStrategy:
     
     def _reset_round(self):
         """Reset to waiting for new round."""
+        self._cancel_stop_loss_timer()
         self._current_round = None
-    
-    def _update_price_history(self, up_ask: float, down_ask: float, ts: float):
-        """Update price history for dip detection."""
-        self._price_history.append({
-            'timestamp': ts,
-            'up_ask': up_ask,
-            'down_ask': down_ask
-        })
-        
-        # Trim history
-        if len(self._price_history) > self._max_history_length:
-            self._price_history = self._price_history[-self._max_history_length:]
-    
-    def _detect_dip(self, current_price: float, side: DipArbSide) -> bool:
-        """
-        Detect if current price represents a significant dip.
-        
-        Uses sliding window to compare current price with recent average.
-        """
-        if len(self._price_history) < 5:
-            return False
-        
-        # Get recent prices for this side
-        key = 'up_ask' if side == DipArbSide.UP else 'down_ask'
-        recent_prices = [p[key] for p in self._price_history[-10:-1]]
-        
-        if not recent_prices:
-            return False
-        
-        avg_price = sum(recent_prices) / len(recent_prices)
-        dip_percent = (avg_price - current_price) / avg_price
-        
-        return dip_percent >= self.dip_threshold
-    
-    def _check_leg1_opportunity(
-        self,
-        up_ask: float,
-        down_ask: float,
-        ts: float
-    ) -> Optional[DipArbSignal]:
-        """Check for Leg1 dip opportunity."""
-        
-        # Check for UP dip
-        if self._detect_dip(up_ask, DipArbSide.UP):
-            # Calculate potential profit if we can hedge at current DOWN ask
-            total_cost = up_ask + down_ask
-            if total_cost < self.max_total_cost:
-                profit = 1.0 - total_cost
-                profit_rate = profit / total_cost
-                
-                if profit_rate >= self.min_profit_rate:
-                    signal = self._create_signal(
-                        signal_type='leg1',
-                        side=DipArbSide.UP,
-                        price=up_ask,
-                        expected_profit=profit,
-                        reason=f"UP dip detected, potential {profit_rate*100:.1f}% profit"
-                    )
-                    self._emit_signal(signal)
-                    return signal
-        
-        # Check for DOWN dip
-        if self._detect_dip(down_ask, DipArbSide.DOWN):
-            total_cost = up_ask + down_ask
-            if total_cost < self.max_total_cost:
-                profit = 1.0 - total_cost
-                profit_rate = profit / total_cost
-                
-                if profit_rate >= self.min_profit_rate:
-                    signal = self._create_signal(
-                        signal_type='leg1',
-                        side=DipArbSide.DOWN,
-                        price=down_ask,
-                        expected_profit=profit,
-                        reason=f"DOWN dip detected, potential {profit_rate*100:.1f}% profit"
-                    )
-                    self._emit_signal(signal)
-                    return signal
-        
-        return None
-    
-    def _check_leg2_opportunity(
-        self,
-        up_ask: float,
-        down_ask: float,
-        ts: float
-    ) -> Optional[DipArbSignal]:
-        """Check for Leg2 hedge opportunity."""
-        if not self._current_round or not self._current_round.leg1:
-            return None
-        
-        leg1 = self._current_round.leg1
-        
-        # Determine hedge side (opposite of leg1)
-        if leg1.side == DipArbSide.UP:
-            hedge_side = DipArbSide.DOWN
-            hedge_price = down_ask
-        else:
-            hedge_side = DipArbSide.UP
-            hedge_price = up_ask
-        
-        # Calculate total cost and profit
-        total_cost = leg1.price + hedge_price
-        
-        if total_cost < self.max_total_cost:
-            profit = 1.0 - total_cost
-            profit_rate = profit / total_cost
-            
-            if profit_rate >= self.min_profit_rate:
-                signal = self._create_signal(
-                    signal_type='leg2',
-                    side=hedge_side,
-                    price=hedge_price,
-                    expected_profit=profit,
-                    reason=f"Hedge available, total cost {total_cost:.4f}, profit {profit_rate*100:.1f}%"
-                )
-                self._emit_signal(signal)
-                return signal
-        
-        return None
-    
-    def _create_signal(
-        self,
-        signal_type: str,
-        side: DipArbSide,
-        price: float,
-        expected_profit: float,
-        reason: str
-    ) -> DipArbSignal:
-        """Create a trading signal."""
-        token_id = ""
-        if self._market:
-            token_id = self._market.up_token_id if side == DipArbSide.UP else self._market.down_token_id
-        
-        shares = self.position_size / price if price > 0 else 0
-        
-        return DipArbSignal(
-            signal_type=signal_type,
-            side=side,
-            token_id=token_id,
-            target_price=price,
-            current_price=price,
-            shares=shares,
-            reason=reason,
-            expected_profit=expected_profit,
-            round_id=self._current_round.round_id if self._current_round else "unknown"
-        )
     
     def _emit_signal(self, signal: DipArbSignal):
         """Emit signal to handler."""
@@ -456,37 +670,111 @@ class DipArbStrategy:
             except Exception as e:
                 logger.error(f"Signal handler error: {e}")
         
-        logger.info(f"Signal: {signal.signal_type.upper()} {signal.side.value} @ {signal.target_price:.4f}")
+        emoji = "🔴" if signal.is_sell else "🟢"
+        action = "SELL" if signal.is_sell else "BUY"
+        logger.info(f"{emoji} Signal: {signal.signal_type.upper()} {action} {signal.side.value} @ {signal.target_price:.4f}")
+    
+    # =========================================================================
+    # Status & Stats
+    # =========================================================================
+    
+    def get_stats(self) -> DipArbStats:
+        """Get current statistics."""
+        self._stats.running_time_ms = (time.time() - self._stats.start_time) * 1000
+        return self._stats
+    
+    def get_status(self) -> Dict:
+        """Get current status."""
+        return {
+            'version': self.VERSION,
+            'market': self._market.name if self._market else None,
+            'underlying': self._market.underlying if self._market else None,
+            'round_id': self._current_round.round_id if self._current_round else None,
+            'phase': self._current_round.phase.value if self._current_round else 'idle',
+            'leg1': {
+                'side': self._current_round.leg1.side.value,
+                'price': self._current_round.leg1.price,
+                'shares': self._current_round.leg1.shares,
+                'age_seconds': time.time() - self._current_round.leg1_fill_time if self._current_round.leg1_fill_time else 0
+            } if self._current_round and self._current_round.leg1 else None,
+            'config': {
+                'sliding_window_ms': self.config.sliding_window_ms,
+                'dip_threshold': self.config.dip_threshold,
+                'sum_target': self.config.sum_target,
+                'leg2_timeout_seconds': self.config.leg2_timeout_seconds,
+                'auto_merge': self.config.auto_merge,
+                'split_orders': self.config.split_orders
+            },
+            'stats': {
+                'rounds_monitored': self._stats.rounds_monitored,
+                'rounds_successful': self._stats.rounds_successful,
+                'rounds_stop_loss': self._stats.rounds_stop_loss,
+                'total_profit': self._stats.total_profit,
+                'merges_completed': self._stats.merges_completed,
+                'markets_rotated': self._stats.markets_rotated
+            }
+        }
+    
+    def format_status(self) -> str:
+        """Format status as readable string."""
+        status = self.get_status()
+        
+        lines = [
+            f"📊 DipArb Status ({self.VERSION})",
+            f"{'='*40}",
+            f"Market: {status['market'] or 'None'}",
+            f"Phase: {status['phase']}",
+        ]
+        
+        if status['leg1']:
+            leg1 = status['leg1']
+            lines.append(f"Leg1: {leg1['side']} x{leg1['shares']:.2f} @ {leg1['price']:.4f} ({leg1['age_seconds']:.0f}s ago)")
+        
+        lines.extend([
+            f"\n📈 Stats:",
+            f"  Rounds: {status['stats']['rounds_successful']}/{status['stats']['rounds_monitored']}",
+            f"  Profit: ${status['stats']['total_profit']:.2f}",
+            f"  Stop Losses: {status['stats']['rounds_stop_loss']}",
+            f"  Merges: {status['stats']['merges_completed']}",
+        ])
+        
+        return "\n".join(lines)
 
 
-# Convenience function
-def analyze_dip_arb(
-    up_ask: float,
-    down_ask: float,
-    min_profit_rate: float = 0.02
-) -> Dict:
-    """
-    Quick analysis of DipArb opportunity.
-    
-    Args:
-        up_ask: UP token ask price
-        down_ask: DOWN token ask price
-        min_profit_rate: Minimum profit rate
-    
-    Returns:
-        Dict with analysis results
-    """
+# Convenience functions
+def create_dip_arb_service(
+    sliding_window_ms: int = 3000,
+    dip_threshold: float = 0.30,
+    sum_target: float = 0.95,
+    leg2_timeout_seconds: int = 100,
+    **kwargs
+) -> DipArbService:
+    """Create DipArb service with common parameters."""
+    config = DipArbConfig(
+        sliding_window_ms=sliding_window_ms,
+        dip_threshold=dip_threshold,
+        sum_target=sum_target,
+        leg2_timeout_seconds=leg2_timeout_seconds,
+        **kwargs
+    )
+    return DipArbService(config)
+
+
+def analyze_dip_arb(up_ask: float, down_ask: float, sum_target: float = 0.95) -> Dict:
+    """Quick analysis of current opportunity."""
     total_cost = up_ask + down_ask
     profit = 1.0 - total_cost
     profit_rate = profit / total_cost if total_cost > 0 else 0
+    is_profitable = total_cost <= sum_target
     
     return {
         'up_ask': up_ask,
         'down_ask': down_ask,
         'total_cost': total_cost,
+        'sum_target': sum_target,
         'profit': profit,
         'profit_rate': profit_rate,
         'profit_pct': f"{profit_rate*100:.2f}%",
-        'is_profitable': profit_rate >= min_profit_rate,
-        'recommendation': 'BUY BOTH' if profit_rate >= min_profit_rate else 'WAIT'
+        'is_profitable': is_profitable,
+        'recommendation': 'BUY BOTH' if is_profitable else 'WAIT'
     }
